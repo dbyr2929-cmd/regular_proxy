@@ -1,6 +1,6 @@
 import socket
 import threading
-import os
+import ssl
 
 def relay(source, destination):
     try:
@@ -28,7 +28,6 @@ def handle_client(client_socket):
             client_socket.close()
             return
 
-        # 1. Handling HTTPS Tunneling (CONNECT method)
         if request.startswith(b'CONNECT'):
             first_line = request.split(b'\n')[0]
             try:
@@ -48,18 +47,13 @@ def handle_client(client_socket):
                 client_socket.close()
                 return
 
-            # Tell the browser the tunnel is ready
             client_socket.send(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            
-            # Start two-way relay (The 'Pipe')
             thread1 = threading.Thread(target=relay, args=(client_socket, server_socket))
             thread2 = threading.Thread(target=relay, args=(server_socket, client_socket))
             thread1.start()
             thread2.start()
             thread1.join()
             thread2.join()
-            
-        # 2. Handling standard HTTP (GET/POST etc)
         else:
             first_line = request.split(b'\n')[0]
             try:
@@ -71,12 +65,10 @@ def handle_client(client_socket):
             http_pos = url.find(b'://')
             if http_pos != -1:
                 url = url[http_pos + 3:]
-            
             port = 80
             webserver_pos = url.find(b'/')
             if webserver_pos == -1:
                 webserver_pos = len(url)
-            
             port_pos = url.find(b':')
             if port_pos != -1 and port_pos < webserver_pos:
                 try:
@@ -91,46 +83,50 @@ def handle_client(client_socket):
                 server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 server_socket.connect((webserver.decode('utf-8'), port))
                 server_socket.sendall(request)
-                
-                while True:
-                    data = server_socket.recv(4096)
-                    if data:
-                        client_socket.sendall(data)
-                    else:
-                        break
-                server_socket.close()
             except Exception:
                 client_socket.close()
                 return
 
+            while True:
+                data = server_socket.recv(4096)
+                if data:
+                    client_socket.sendall(data)
+                else:
+                    break
+            server_socket.close()
     except Exception as e:
-        print(f"Error handling client: {e}")
+        print("Error handling client:", e)
     finally:
         client_socket.close()
 
 def main():
-    # Railway provides the port via an environment variable
-    listen_port = int(os.environ.get("PORT", 8443))
     listen_addr = '0.0.0.0'
-    
+    listen_port = 8443
     proxy_server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     proxy_server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     proxy_server.bind((listen_addr, listen_port))
-    proxy_server.listen(100) # Increased backlog for stability
-    
-    print(f"[*] Proxy server active on port {listen_port}")
-    print("[*] Note: SSL is handled by the Railway edge router.")
+    proxy_server.listen(5)
+    print(f"[*] Secure proxy server listening on {listen_addr}:{listen_port}")
+
+    ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    ssl_context.load_cert_chain(certfile="server.crt", keyfile="server.key")
 
     while True:
+        client_sock, addr = proxy_server.accept()
+        print(f"[*] Accepted connection from {addr}")
         try:
-            client_sock, addr = proxy_server.accept()
-            # We no longer use ssl_context.wrap_socket here.
-            # Railway has already decrypted the outer layer for us.
-            client_handler = threading.Thread(target=handle_client, args=(client_sock,))
-            client_handler.setDaemon(True)
-            client_handler.start()
+            secure_sock = ssl_context.wrap_socket(client_sock, server_side=True)
         except Exception as e:
-            print(f"Connection error: {e}")
+            print("SSL handshake failed:", e)
+            client_sock.close()
+            continue
+
+        client_handler = threading.Thread(target=handle_client, args=(secure_sock,))
+        client_handler.start()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[*] Shutting down the secure proxy server. Press Enter to exit.")
+        input()
